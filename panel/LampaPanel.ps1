@@ -16,6 +16,14 @@ $TorrUrl  = "http://${IP}:$($cfg.torrPort)/"
 $Site     = $cfg.siteDir
 $TorrDir  = $cfg.torrDir
 $Svc      = $cfg.serviceName
+$script:Jackett = if ($cfg.PSObject.Properties['jackettUrl'] -and $cfg.jackettUrl) { [string]$cfg.jackettUrl } else { 'https://jr.maxvol.pro' }
+. (Join-Path $PSScriptRoot 'TvDefaults.ps1')
+
+# Проверка парсера идёт асинхронно (публичный Jackett отвечает 5-15 с), окно не подвисает
+Add-Type -AssemblyName System.Net.Http
+$script:http = New-Object System.Net.Http.HttpClient
+$script:http.Timeout = [TimeSpan]::FromSeconds(40)
+$script:pTask = $null; $script:pSw = $null; $script:pTicks = 0
 
 function Test-Http([string]$url) {
     try {
@@ -56,7 +64,7 @@ function Invoke-Elevated([string]$target, [string]$action) {
 # ---------- UI ----------
 $form = New-Object Windows.Forms.Form
 $form.Text = 'Lampa сервер для ТВ'
-$form.Size = New-Object Drawing.Size(470, 465)
+$form.Size = New-Object Drawing.Size(470, 565)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'; $form.MaximizeBox = $false
 $form.Font = New-Object Drawing.Font('Segoe UI', 10)
@@ -98,12 +106,40 @@ New-Button 'Перезапустить' 305 223 135 { Invoke-Elevated 'Torr' 'Re
 New-Button 'Открыть TorrServer' 15 258 205 { Start-Process $TorrUrl } | Out-Null
 New-Button 'Папка TorrServer'  235 258 205 { Start-Process explorer.exe $TorrDir } | Out-Null
 
+# Парсер
+New-Label 'Парсер торрентов (Jackett)' 15 310 420 $true | Out-Null
+$lblParser = New-Label '...' 15 334
+New-Button 'Проверить'       15 361 135 { Start-ParserCheck } | Out-Null
+New-Button 'Сменить парсер…' 160 361 135 {
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    $v = [Microsoft.VisualBasic.Interaction]::InputBox(
+        "Адрес Jackett-парсера для Lampa.`nПо умолчанию: https://jr.maxvol.pro`nПосле смены нажмите «Проверить»: статус покажет, отвечает ли новый адрес.", 'Сменить парсер', $script:Jackett)
+    $v = $v.Trim().TrimEnd('/')
+    if (-not $v -or $v -eq $script:Jackett) { return }
+    if ($v -notmatch '^https?://') { $v = 'http://' + $v }
+    try {
+        $c = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $c | Add-Member -NotePropertyName jackettUrl -NotePropertyValue $v -Force
+        [IO.File]::WriteAllText($cfgPath, ($c | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+        $script:Jackett = $v
+        Write-TvServerJs $Site $IP $cfg.torrPort $v ((Get-TvServerJsVersion $Site) + 1)
+        Start-ParserCheck
+        [Windows.Forms.MessageBox]::Show("Парсер: $v`n`nНа телевизоре закройте и снова откройте MSX — Lampa возьмёт новый адрес.", 'Lampa сервер') | Out-Null
+    } catch { [Windows.Forms.MessageBox]::Show("Не получилось: $_", 'Lampa сервер', 'OK', 'Warning') | Out-Null }
+} | Out-Null
+New-Button 'Обновить на ТВ' 305 361 135 {
+    try {
+        Write-TvServerJs $Site $IP $cfg.torrPort $script:Jackett ((Get-TvServerJsVersion $Site) + 1)
+        [Windows.Forms.MessageBox]::Show("При следующем запуске MSX на телевизоре Lampa заново пропишет:`n• TorrServer: $TorrUrl`n• парсер: $($script:Jackett)`n`nЗакройте и снова откройте MSX на ТВ.", 'Lampa сервер') | Out-Null
+    } catch { [Windows.Forms.MessageBox]::Show("Не получилось: $_", 'Lampa сервер', 'OK', 'Warning') | Out-Null }
+} | Out-Null
+
 # Общее
-New-Label 'Адреса в локальной сети' 15 310 420 $true | Out-Null
-New-Label "Lampa:  $LampaUrl" 15 334 | Out-Null
-New-Label "MSX:    $MsxUrl" 15 356 | Out-Null
-New-Button 'Обновить статус' 15 385 205 { Update-Status } | Out-Null
-$lblTime = New-Label '' 235 391 205
+New-Label 'Адреса в локальной сети' 15 410 420 $true | Out-Null
+New-Label "Lampa:  $LampaUrl" 15 434 | Out-Null
+New-Label "MSX:    $MsxUrl" 15 456 | Out-Null
+New-Button 'Обновить статус' 15 485 205 { Update-Status; Start-ParserCheck } | Out-Null
+$lblTime = New-Label '' 235 491 205
 
 function Set-State($label, [bool]$ok, [string]$text) {
     $label.Text = $text
@@ -124,9 +160,39 @@ function Update-Status {
     $form.Cursor = 'Default'
 }
 
-$timer = New-Object Windows.Forms.Timer
+function Start-ParserCheck {
+    if ($script:pTask -and -not $script:pTask.IsCompleted) { return }
+    $url = $script:Jackett.TrimEnd('/') + '/api/v2.0/indexers/all/results?apikey=&Query=' + [uri]::EscapeDataString('Матрица')
+    $lblParser.Text = "● Проверка… — $($script:Jackett)"
+    $lblParser.ForeColor = [Drawing.Color]::DimGray
+    $script:pSw = [Diagnostics.Stopwatch]::StartNew()
+    $script:pTask = $script:http.GetStringAsync($url)
+}
+
+function Update-ParserResult {
+    if (-not $script:pTask -or -not $script:pTask.IsCompleted) { return }
+    $sec = '{0:N1}' -f $script:pSw.Elapsed.TotalSeconds
+    if ($script:pTask.Status -eq 'RanToCompletion') {
+        $n = $null
+        try { $n = @(($script:pTask.Result | ConvertFrom-Json).Results).Count } catch {}
+        if ($null -ne $n) { Set-State $lblParser $true "● Отвечает: $n раздач за $sec с — $($script:Jackett)" }
+        else              { Set-State $lblParser $false "● Ответ не похож на Jackett — $($script:Jackett)" }
+    } else {
+        Set-State $lblParser $false "● Не отвечает ($sec с) — $($script:Jackett)"
+    }
+    $script:pTask = $null
+}
+
+$timer = New-Object Windows.Forms.Timer          # статус Lampa/TorrServer каждые 10 с, парсер каждые 2 мин
 $timer.Interval = 10000
-$timer.Add_Tick({ Update-Status })
-$form.Add_Shown({ Update-Status; $timer.Start() })
-$form.Add_FormClosed({ $timer.Stop() })
+$timer.Add_Tick({
+    Update-Status
+    $script:pTicks++
+    if ($script:pTicks -ge 12) { $script:pTicks = 0; Start-ParserCheck }
+})
+$pollTimer = New-Object Windows.Forms.Timer      # забирает результат асинхронной проверки парсера
+$pollTimer.Interval = 500
+$pollTimer.Add_Tick({ Update-ParserResult })
+$form.Add_Shown({ Update-Status; Start-ParserCheck; $timer.Start(); $pollTimer.Start() })
+$form.Add_FormClosed({ $timer.Stop(); $pollTimer.Stop(); $script:http.Dispose() })
 [void]$form.ShowDialog()
